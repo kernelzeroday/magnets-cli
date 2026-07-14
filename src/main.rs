@@ -10,7 +10,7 @@ use clap::{Args, Parser, Subcommand};
 use futures_util::{StreamExt, stream};
 use quick_xml::{Reader, escape::unescape, events::Event};
 use reqwest::{Client, Url};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     env,
@@ -19,7 +19,7 @@ use std::{
     io::IsTerminal,
     path::PathBuf,
     process::ExitCode,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{process::Command, time::timeout};
 
@@ -33,6 +33,7 @@ const GREEN: &str = "\x1b[32m";
 const YELLOW: &str = "\x1b[33m";
 const MAGENTA: &str = "\x1b[35m";
 const CYAN: &str = "\x1b[36m";
+const SEARCH_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Parser)]
 #[command(
@@ -120,7 +121,7 @@ struct SearchArgs {
     #[arg(short = 'n', long, default_value_t = 20)]
     limit: usize,
 
-    /// Maximum endpoints to search after discovery or cache lookup
+    /// Concurrent endpoint count per fallback batch
     #[arg(long, default_value_t = 10)]
     fanout: usize,
 
@@ -160,7 +161,7 @@ struct DiscoveryResult {
     latency_ms: u128,
 }
 
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 struct Torrent {
     source: String,
     title: String,
@@ -173,6 +174,12 @@ struct Torrent {
     seeders: Option<u64>,
     leechers: Option<u64>,
     grabs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct CachedSearch {
+    saved_at_secs: u64,
+    torrents: Vec<Torrent>,
 }
 
 #[tokio::main]
@@ -269,33 +276,39 @@ async fn search(args: SearchArgs, color: bool) -> Result<()> {
     }
 
     sources = deduplicate_sources(sources);
-    sources.truncate(args.fanout);
     if sources.is_empty() {
         bail!("provide --indexer <full Torznab URL>, set MAGNETS_INDEXERS, or add --shodan");
     }
 
     let query = args.query.join(" ");
     let api_key = args.api_key.as_deref();
-    let searches =
-        stream::iter(
-            sources.into_iter().map(|source| {
+    let mut torrents = Vec::new();
+    let mut failures = Vec::new();
+
+    // Public instances are often briefly overloaded or disappear. Search the
+    // fastest batch first, then continue through the cached list only if that
+    // batch produces no usable result.
+    for batch in sources.chunks(args.fanout) {
+        let searches =
+            stream::iter(batch.iter().cloned().map(|source| {
                 let client = client.clone();
                 let query = query.clone();
                 async move {
                     search_source(&client, source, &query, args.per_source_limit, api_key).await
                 }
-            }),
-        )
-        .buffer_unordered(args.discovery.concurrency)
-        .collect::<Vec<_>>()
-        .await;
+            }))
+            .buffer_unordered(args.discovery.concurrency)
+            .collect::<Vec<_>>()
+            .await;
 
-    let mut torrents = Vec::new();
-    let mut failures = Vec::new();
-    for result in searches {
-        match result {
-            Ok(mut response) => torrents.append(&mut response),
-            Err(error) => failures.push(error),
+        for result in searches {
+            match result {
+                Ok(mut response) => torrents.append(&mut response),
+                Err(error) => failures.push(error),
+            }
+        }
+        if !torrents.is_empty() {
+            break;
         }
     }
 
@@ -314,10 +327,28 @@ async fn search(args: SearchArgs, color: bool) -> Result<()> {
     torrents.truncate(args.limit);
 
     if torrents.is_empty() {
+        if let Some(cached) = load_cached_search(&query) {
+            eprintln!(
+                "warning: live indexers are unavailable; showing a cached result from the last {} minutes",
+                SEARCH_CACHE_TTL.as_secs() / 60
+            );
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&cached)?);
+            } else {
+                print_torrents(&cached, color);
+            }
+            return Ok(());
+        }
         if failures.is_empty() {
             bail!("no results found for: {query}");
         }
         bail!("no indexer returned results for: {query} (use --verbose for request failures)");
+    }
+
+    if let Err(error) = save_cached_search(&query, &torrents)
+        && args.discovery.verbose
+    {
+        eprintln!("warning: could not save search cache: {error:#}");
     }
 
     if args.json {
@@ -412,6 +443,64 @@ fn save_discovered_sources(results: &[DiscoveryResult]) -> Result<Option<PathBuf
     fs::write(&path, format!("{content}\n"))
         .with_context(|| format!("could not save endpoints to {}", path.display()))?;
     Ok(Some(path))
+}
+
+fn search_cache_path(query: &str) -> Option<PathBuf> {
+    let base = env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
+    Some(
+        base.join("magnets")
+            .join("searches")
+            .join(format!("{:016x}.json", query_hash(query))),
+    )
+}
+
+fn query_hash(query: &str) -> u64 {
+    // A stable cache filename, not a security boundary.
+    query
+        .to_lowercase()
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+}
+
+fn load_cached_search(query: &str) -> Option<Vec<Torrent>> {
+    let path = search_cache_path(query)?;
+    let content = fs::read_to_string(path).ok()?;
+    let cached: CachedSearch = serde_json::from_str(&content).ok()?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    if now.saturating_sub(cached.saved_at_secs) <= SEARCH_CACHE_TTL.as_secs() {
+        Some(cached.torrents)
+    } else {
+        None
+    }
+}
+
+fn save_cached_search(query: &str, torrents: &[Torrent]) -> Result<()> {
+    let Some(path) = search_cache_path(query) else {
+        return Ok(());
+    };
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("search cache path has no parent"))?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "could not create search cache directory {}",
+            parent.display()
+        )
+    })?;
+    let saved_at_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs();
+    let content = serde_json::to_string(&CachedSearch {
+        saved_at_secs,
+        torrents: torrents.to_vec(),
+    })?;
+    fs::write(&path, content)
+        .with_context(|| format!("could not write search cache {}", path.display()))
 }
 
 async fn discover(client: &Client, options: &DiscoveryOptions) -> Result<Vec<DiscoveryResult>> {

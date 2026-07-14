@@ -54,7 +54,9 @@ magnets search "ubuntu 24.04" -n 10
 magnets search "ubuntu 24.04" --shodan -n 10
 ```
 
-`discover` writes verified endpoints to `~/.config/magnets/indexers` (or `$XDG_CONFIG_HOME/magnets/indexers`). Bare searches use that cache automatically and query up to ten endpoints; increase `--fanout` if needed. `-n` limits the combined output; `--per-source-limit` controls the request size per endpoint.
+`discover` writes verified endpoints to `~/.config/magnets/indexers` (or `$XDG_CONFIG_HOME/magnets/indexers`). Bare searches use that cache automatically: they search the fastest ten endpoints first, then fall through to later cached endpoints if none return results. `--fanout` changes the batch size. `-n` limits the combined output; `--per-source-limit` controls the request size per endpoint.
+
+Successful searches are also cached for 15 minutes in `~/.cache/magnets/searches` (or `$XDG_CACHE_HOME/magnets/searches`). If every public endpoint is temporarily unavailable, the recent cached result is shown instead.
 
 Use `--verbose` to see rejected candidates, `--shodan-limit` to change the candidate count, `--concurrency` to bound parallel HTTP requests, and `--json` for machine-readable output. A custom `--shodan-query` is available when you have a different Torznab-compatible software fingerprint to validate.
 
